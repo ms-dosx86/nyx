@@ -1,0 +1,303 @@
+# Shared runtime settings; DOMAIN is a hostname without a scheme or path.
+x-runtime: &runtime
+  ENV: local
+  PORT: 80
+  PG_HOST: postgres
+  PG_PORT: 5432
+  PG_DATABASE: nyx
+  PG_USER: ${PG_USER:?Set PG_USER in .env}
+  PG_PASS: ${PG_PASS:?Set PG_PASS in .env}
+  PG_SSL_MODE: disable
+  PG_MAX_CONNS: ${PG_MAX_CONNS:-20}
+  REDIS_ADDR: valkey:6379
+  REDIS_USER: default
+  REDIS_PASS: ${REDIS_PASS:?Set REDIS_PASS in .env}
+  JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?Set JWT_ACCESS_SECRET in .env}
+  JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?Set JWT_REFRESH_SECRET in .env}
+  CDN_URL: ${CDN_URL:-https://cdn.${DOMAIN:?Set DOMAIN in .env}}
+  CDN_PRIVATE_URL: ${CDN_PRIVATE_URL:-${CDN_URL:-https://cdn.${DOMAIN:?Set DOMAIN in .env}}}
+  CDN_SECRET: ${CDN_SECRET:?Set CDN_SECRET in .env}
+  S3_ENDPOINT: s3.${DOMAIN:?Set DOMAIN in .env}
+  S3_USE_SSL: "true"
+  S3_REGION: us-east-1
+  S3_ACCESS_KEY: nyx-storage
+  S3_SECRET_KEY: ${S3_SECRET_KEY:?Set S3_SECRET_KEY in .env}
+  S3_BUG_REPORTS_BUCKET: bug-reports-dev
+  S3_ATTACHMENTS_BUCKET: attachments
+  S3_CHANNELS_BUCKET: 5231b33b-channels-dev
+  S3_STREAM_PREVIEWS_BUCKET: 5231b33b-stream-previews-dev
+  S3_AVATARS_BUCKET: 5231b33b-avatars-dev
+  S3_BANNERS_BUCKET: banners-dev
+  S3_SERVER_AVATARS_BUCKET: 5231b33b-serveravatars-dev
+  S3_NICKNAME_ICONS_BUCKET: nickname-icons-dev
+  S3_BADGES_BUCKET: badges-dev
+  S3_STATIC_BUCKET: static-dev
+  S3_DOCUMENTS_BUCKET: documents-dev
+  S3_DESKTOP_APP_BUCKET: 5231b33b-nyx-desktop-app-dev
+  LIVEKIT_URL: http://livekit:7880
+  LIVEKIT_PUBLIC_URL: wss://livekit.${DOMAIN:?Set DOMAIN in .env}
+  LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY in .env}
+  LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET in .env}
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      default:
+        # Signed S3 URLs retain their public host, without requiring NAT loopback.
+        aliases:
+          - s3.${DOMAIN:?Set DOMAIN in .env}
+    depends_on:
+      - client
+      - server
+      - admin
+      - cdn
+      - livekit
+      - minio
+  client:
+    image: msdosx86/nyx-client-react:v0.91.0
+    platform: linux/amd64
+    restart: unless-stopped
+  server:
+    image: &server-image msdosx86/nyx-server-v2:v0.52.0
+    platform: linux/amd64
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      <<: *runtime
+      METRICS_TOKEN: ${METRICS_TOKEN:?Set METRICS_TOKEN in .env}
+      DISABLE_ASYNQ_TASKS: "false"
+      DESKTOP_UPDATE_STABLE_URL: https://cdn.${DOMAIN:?Set DOMAIN in .env}/desktop-app/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+  # Explicit maintenance command; never runs as part of a normal `up`.
+  migrate:
+    image: *server-image
+    platform: linux/amd64
+    profiles: [maintenance]
+    entrypoint: ["/migrate"]
+    command:
+      - -path=/migrations
+      - -database
+      - ${MIGRATION_DATABASE_URL:-postgres://${PG_USER:-nyx}:${PG_PASS:?Set PG_PASS in .env}@postgres:5432/${PG_DATABASE:-nyx}?sslmode=disable}
+      - up
+    depends_on:
+      postgres:
+        condition: service_healthy
+  scheduler:
+    image: msdosx86/nyx-scheduler:v0.2.0
+    platform: linux/amd64
+    restart: unless-stopped
+    environment: *runtime
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+  admin:
+    image: msdosx86/nyx-admin-v2:0.25.0
+    platform: linux/amd64
+    restart: unless-stopped
+    environment:
+      <<: *runtime
+      ADMIN_LOGIN: ${ADMIN_LOGIN:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
+      ADMIN_SESSION_SECRET: ${ADMIN_SESSION_SECRET:?Set ADMIN_SESSION_SECRET in .env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+  cdn:
+    image: msdosx86/nyx-cdn:v0.10.0
+    platform: linux/amd64
+    restart: unless-stopped
+    environment: *runtime
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PG_DATABASE:-nyx}
+      POSTGRES_USER: ${PG_USER:-nyx}
+      POSTGRES_PASSWORD: ${PG_PASS:?Set PG_PASS in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  livekit:
+    image: livekit/livekit-server:latest
+    restart: unless-stopped
+    command: --config /etc/livekit.yaml
+    ports:
+      - "7881:7881"
+      - "3478:3478/udp"
+      - "50000-50100:50000-50100/udp"
+    configs:
+      - source: livekit
+        target: /etc/livekit.yaml
+    depends_on:
+      valkey:
+        condition: service_healthy
+  valkey:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASS:?Set REDIS_PASS in .env}
+    volumes:
+      - valkey_data:/data
+    command: ["valkey-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASS:?Set REDIS_PASS in .env}"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  minio:
+    image: &minio-image docker.io/coollabsio/minio:RELEASE.2025-04-22T22-12-26Z@sha256:a4938f37f1be1841b8e7b627ad0207b265345fd0d063e42d7410c78af0e63e68
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-nyx-storage}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?Set S3_SECRET_KEY in .env}
+    ports:
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio_community_data:/data
+  minio-init:
+    image: *minio-image
+    depends_on:
+      - minio
+    environment: *runtime
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        until mc alias set local http://minio:9000 "$${S3_ACCESS_KEY}" "$${S3_SECRET_KEY}"; do
+          echo 'Waiting for MinIO...'
+          sleep 2
+        done
+        mc mb --ignore-existing "local/$${S3_BUG_REPORTS_BUCKET}"
+        mc mb --ignore-existing "local/$${S3_ATTACHMENTS_BUCKET}"
+        mc mb --ignore-existing "local/$${S3_CHANNELS_BUCKET}"
+        mc mb --ignore-existing "local/$${S3_STREAM_PREVIEWS_BUCKET}"
+        mc mb --ignore-existing "local/$${S3_AVATARS_BUCKET}"
+        mc mb --ignore-existing "local/$${S3_BANNERS_BUCKET}"
+        mc mb --ignore-existing "local/$${S3_SERVER_AVATARS_BUCKET}"
+        mc mb --ignore-existing "local/$${S3_NICKNAME_ICONS_BUCKET}"
+        mc mb --ignore-existing "local/$${S3_BADGES_BUCKET}"
+        mc mb --ignore-existing "local/$${S3_STATIC_BUCKET}"
+        mc mb --ignore-existing "local/$${S3_DOCUMENTS_BUCKET}"
+        mc mb --ignore-existing "local/$${S3_DESKTOP_APP_BUCKET}"
+
+        echo 'MinIO buckets initialized'
+
+# DOMAIN is a bare hostname, for example nyx.example.org (no scheme or path).
+# Inline configs require Docker Compose 2.23.1 or newer.
+configs:
+  livekit:
+    content: |
+      port: 7880
+      rtc:
+        tcp_port: 7881
+        port_range_start: 50000
+        port_range_end: 50100
+        use_external_ip: true
+      redis:
+        address: valkey:6379
+        username: default
+        password: "${REDIS_PASS:?Set REDIS_PASS in .env}"
+      keys:
+        "${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY in .env}": "${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET in .env}"
+      webhook:
+        api_key: "${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY in .env}"
+        urls:
+          - http://server:80/api/webhooks/v1/livekit
+      turn:
+        enabled: true
+        udp_port: 3478
+  caddyfile:
+    content: |
+      ${DOMAIN:?Set DOMAIN in .env} {
+          @api path /api /api/*
+          handle @api {
+              @cors header Origin *
+              @preflight {
+                  method OPTIONS
+                  header Origin *
+                  header Access-Control-Request-Method *
+              }
+
+              header {
+                  +Vary Origin
+                  +Vary Access-Control-Request-Method
+                  +Vary Access-Control-Request-Headers
+                  defer
+              }
+              header @cors {
+                  Access-Control-Allow-Origin "{http.request.header.Origin}"
+                  Access-Control-Allow-Credentials "true"
+                  Access-Control-Allow-Methods "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"
+                  Access-Control-Allow-Headers "{http.request.header.Access-Control-Request-Headers}"
+                  Access-Control-Max-Age "3600"
+                  defer
+              }
+
+              respond @preflight 204
+
+              reverse_proxy server:80 {
+                  header_down -Access-Control-*
+              }
+          }
+          handle {
+              reverse_proxy client:80
+          }
+      }
+
+      admin.${DOMAIN:?Set DOMAIN in .env} {
+          reverse_proxy admin:80
+      }
+
+      cdn.${DOMAIN:?Set DOMAIN in .env} {
+          reverse_proxy cdn:80
+      }
+
+      livekit.${DOMAIN:?Set DOMAIN in .env} {
+          reverse_proxy livekit:7880
+      }
+
+      s3.${DOMAIN:?Set DOMAIN in .env} {
+          reverse_proxy minio:9000
+      }
+
+      minio.${DOMAIN:?Set DOMAIN in .env} {
+          reverse_proxy minio:9001
+      }
+
+
+volumes:
+  caddy_data:
+  caddy_config:
+  valkey_data:
+  postgres_data:
+  minio_community_data:
